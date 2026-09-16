@@ -8,7 +8,7 @@ It provides simple objects and methods to:
 * create a Calrissian Kubernetes job in that namespace based on a CWL description and its parameters
 * submit and monitor the job execution and retrieve usage, logs and outputs
 
-Refer to the [documentation](https://terradue.github.io/pycalrissian/) to get started.
+Refer to the [documentation](https://zoo-project.github.io/pycalrissian/) to get started.
 
 ## Development
 
