@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from typing import Dict
 
+from kubernetes import watch as k8s_watch
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from pycalrissian.context import CalrissianContext
@@ -68,14 +69,30 @@ class HelperPod:
             body=pod_manifest,
             namespace=self.context.namespace,
         )
-        while True:
+        # Use Kubernetes Watch API to wait for pod to leave Pending phase
+        # instead of polling with time.sleep
+        w = k8s_watch.Watch()
+        try:
+            for event in w.stream(
+                self.context.core_v1_api.list_namespaced_pod,
+                namespace=self.context.namespace,
+                field_selector=f"metadata.name={self.pod_name}",
+                timeout_seconds=120,
+            ):
+                pod = event["object"]
+                if pod.status.phase != "Pending":
+                    w.stop()
+                    break
+        except ApiException:
+            # Fallback: if watch fails, verify current state
             resp = self.context.core_v1_api.read_namespaced_pod(
                 name=self.pod_name,
                 namespace=self.context.namespace,
             )
-            if resp.status.phase != "Pending":
-                break
-            time.sleep(1)
+            if resp.status.phase == "Pending":
+                raise RuntimeError(
+                    f"Pod {self.pod_name} still pending after watch failure"
+                )
 
     def dismiss(self):
         try:

@@ -4,6 +4,7 @@ import time
 from enum import Enum
 from typing import Dict, List, Optional
 
+from kubernetes import watch
 from kubernetes.client.models.v1_pod import V1Pod
 from kubernetes.client.rest import ApiException
 from loguru import logger
@@ -198,52 +199,121 @@ class CalrissianExecution:
             logger.error(f"Exception when calling get status: {e}\n")
             raise e
 
+    def _kill_job(self, reason: str, wall_time: Optional[int] = None) -> None:
+        """Helper to kill a job and mark execution as killed."""
+        logger.warning(reason)
+        self.killed = True
+        self.runtime_context.batch_v1_api.delete_namespaced_job(
+            namespace=self.runtime_context.namespace,
+            name=self.namespaced_job_name,
+            timeout=wall_time,
+        )
+
     def monitor(
         self, interval: int = 5, grace_period=120, wall_time: Optional[int] = None
     ) -> None:
+        """Monitors job execution using Kubernetes Watch API for event-driven updates.
 
-        if self.is_active():
-            iterations = 0
+        Instead of blindly sleeping between status checks, this method uses the
+        Kubernetes Watch API to stream Job events in real-time. The watch is
+        notified immediately when a Job's status changes (e.g., pod scheduled,
+        container started, job completed/failed), eliminating unnecessary delays.
 
-            while self.is_active():
+        A timeout on the watch stream ensures that grace_period and wall_time
+        checks (e.g., ImagePullBackOff detection) are still performed periodically.
 
-                logger.info(f"job {self.job.job_name} is active")
-                time.sleep(interval)
-                iterations = iterations + 1
+        Args:
+            interval: Timeout (in seconds) for each watch iteration. Controls how
+                often grace_period/wall_time checks are performed when no events
+                arrive. Defaults to 5.
+            grace_period: Time (in seconds) after which pods in ImagePullBackOff
+                state trigger job termination. Defaults to 120.
+            wall_time: Maximum total execution time (in seconds). If set, the job
+                is killed when this time is exceeded. Defaults to None (no limit).
+        """
+        if not self.is_active():
+            logger.warning("job is not submitted")
+            return
 
-                if wall_time is not None and iterations > int(wall_time / interval):
-                    logger.warning(
-                        "reached wall time for execution, killing job"  # noqa: E501
-                    )
-                    self.killed = True
-                    self.runtime_context.batch_v1_api.delete_namespaced_job(
-                        namespace=self.runtime_context.namespace,
-                        name=self.namespaced_job_name,
-                        timeout=wall_time,
+        start_time = time.monotonic()
+        w = watch.Watch()
+
+        try:
+            while True:
+                # Check wall time before starting a new watch cycle
+                elapsed = time.monotonic() - start_time
+                if wall_time is not None and elapsed > wall_time:
+                    self._kill_job(
+                        "reached wall time for execution, killing job",
+                        wall_time=wall_time,
                     )
                     return
 
-                if iterations > int(grace_period / interval):
+                # Check for ImagePullBackOff after grace period
+                if elapsed > grace_period:
                     waiting_pods = self.get_waiting_pods()
                     if waiting_pods:
-                        logger.warning(
-                            "found pods in waiting status with reason ImagePullBackOff, killing job"  # noqa: E501
-                        )
-                        self.killed = True
-                        self.runtime_context.batch_v1_api.delete_namespaced_job(
-                            namespace=self.runtime_context.namespace,
-                            name=self.namespaced_job_name,
-                            timeout=wall_time,
+                        self._kill_job(
+                            "found pods in waiting status with reason "
+                            "ImagePullBackOff, killing job",  # noqa: E501
+                            wall_time=wall_time,
                         )
                         return
 
-            if self.is_complete():
-                logger.info("execution is complete")
-            if self.is_succeeded():
-                logger.info("the outcome is: success!")
+                # Calculate remaining timeout for this watch cycle
+                remaining_wall = None
+                if wall_time is not None:
+                    remaining_wall = max(1, int(wall_time - elapsed))
+                timeout = min(interval, remaining_wall) if remaining_wall else interval
 
-        else:
-            logger.warning("job is not submitted")
+                logger.info(f"job {self.job.job_name} is active")
+
+                # Use Kubernetes Watch API to stream Job events.
+                # The watch will return immediately when a status change occurs
+                # (e.g., pod scheduled, succeeded, failed) instead of waiting
+                # for the full timeout. If no event arrives within `timeout`
+                # seconds, the stream ends and we loop back for periodic checks.
+                try:
+                    for event in w.stream(
+                        self.runtime_context.batch_v1_api.list_namespaced_job,
+                        namespace=self.runtime_context.namespace,
+                        field_selector=f"metadata.name={self.namespaced_job_name}",
+                        timeout_seconds=timeout,
+                    ):
+                        job_obj = event["object"]
+                        status = job_obj.status
+
+                        logger.debug(
+                            f"watch event: type={event['type']}, "
+                            f"active={status.active}, "
+                            f"succeeded={status.succeeded}, "
+                            f"failed={status.failed}"
+                        )
+
+                        # Job completed or failed — stop watching immediately
+                        if status.succeeded or status.failed:
+                            w.stop()
+                            break
+
+                except ApiException as e:
+                    # If watch fails (e.g., 410 Gone due to resource version),
+                    # fall back to a short sleep before retrying
+                    logger.warning(
+                        f"watch stream interrupted, retrying: {e}"
+                    )
+                    time.sleep(min(interval, 2))
+
+                # After the watch stream ends, do a final status check
+                if self.is_complete():
+                    break
+
+        finally:
+            w.stop()
+
+        if self.is_complete():
+            logger.info("execution is complete")
+        if self.is_succeeded():
+            logger.info("the outcome is: success!")
 
     def get_waiting_pods(self) -> List[V1Pod]:
 

@@ -5,7 +5,7 @@ import time
 from http import HTTPStatus
 from typing import Dict, Optional, TextIO
 
-from kubernetes import client, config
+from kubernetes import client, config, watch
 from kubernetes.client import Configuration
 from kubernetes.client.models.v1_persistent_volume_claim import V1PersistentVolumeClaim
 from kubernetes.client.rest import ApiException
@@ -357,17 +357,33 @@ class CalrissianContext:
 
     @staticmethod
     def retry(fun, max_tries=10, interval=5, **kwargs):
+        """Retry a check function using exponential backoff.
+
+        Uses a short initial delay that doubles on each retry (capped at
+        `interval` seconds) so that fast-completing resources are detected
+        quickly while still bounding the total wait time.
+        """
+        delay = min(1, interval)  # Start with a 1-second delay
         for i in range(max_tries):
             try:
-                time.sleep(interval)
-                return fun(**kwargs)
+                time.sleep(delay)
+                result = fun(**kwargs)
+                if result is not None:
+                    return result
             except ApiException as exc:
-                if exc.status.value < 500 and exc.status.value != 429:
+                status_code = (
+                    exc.status.value
+                    if hasattr(exc.status, "value")
+                    else exc.status
+                )
+                if status_code < 500 and status_code != 429:
                     # Useless to retry against a 4xx/not-429
                     raise exc
             except Exception:
-                continue
-        if i == max_tries:
+                pass
+            # Exponential backoff, capped at the requested interval
+            delay = min(delay * 2, interval)
+        if i == max_tries - 1:
             raise ApiException()
 
     def create_namespace(
