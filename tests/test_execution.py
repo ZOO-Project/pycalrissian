@@ -8,6 +8,7 @@ from loguru import logger
 from pycalrissian.context import CalrissianContext
 from pycalrissian.execution import CalrissianExecution
 from pycalrissian.job import CalrissianJob
+from kubernetes.client.rest import ApiException
 
 os.environ["KUBECONFIG"] = "~/.kube/kubeconfig-t2-dev.yaml"
 
@@ -171,13 +172,14 @@ class TestCalrissianExecution(unittest.TestCase):
         self.assertTrue(execution.is_succeeded())
         logger.success(f"succeeded {execution.is_succeeded()}")
         
-        # Wait for ttl time, catch IndexError since get_log() tries to read from pod empty list.
-        # Beacuse of IndexError we are sure that the job is deleted.
+        # Wait for ttl time, catch ApiException since get_log() tries to read from pod empty list.
         time.sleep(7)
-        with self.assertRaises(IndexError):
+        with self.assertRaises(ApiException) as cm:
             execution.get_log()
-            logger.info("Job deleted according to ttl")
-            
+
+        # Beacuse of 404 we are sure that the job is deleted.
+        self.assertEqual(cm.exception.status, 404)
+        logger.info("Job deleted according to ttl")
 
     #@unittest.skipIf(os.getenv("CI_TEST_SKIP") == "1", "Test is skipped via env variable")
     def test_high_reqs_job(self):
