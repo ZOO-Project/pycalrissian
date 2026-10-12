@@ -212,11 +212,12 @@ class CalrissianContext:
         logger.info(f"dispose namespace {self.namespace}")
         try:
             response = self.core_v1_api.delete_namespace(
-                name=self.namespace, pretty=True, grace_period_seconds=0
+                name=self.namespace, grace_period_seconds=0
             )
 
-            # if not self.retry(self.dispose):
-            #     raise ApiException()
+            if os.getenv("PYCALRISSIAN_SYNC_DISPOSE", False)=="true":
+                if not self.retry(self.is_namespace_deleted, max_tries=20):
+                    raise ApiException()
             logger.info(f"namespace {self.namespace} deleted")
             return response
 
@@ -327,7 +328,7 @@ class CalrissianContext:
 
     def is_namespace_deleted(self, **kwargs):
         """Helper function for retry in dispose"""
-        return not self.is_namespace_created()
+        return None if self.is_namespace_created() else True
 
     def is_role_binding_created(self, **kwargs):
 
@@ -440,7 +441,7 @@ class CalrissianContext:
         try:
             response = (
                 self.rbac_authorization_v1_api.create_namespaced_role(  # noqa: E501
-                    self.namespace, body, pretty=True
+                    self.namespace, body
                 )
             )
 
@@ -490,7 +491,7 @@ class CalrissianContext:
 
         try:
             response = self.rbac_authorization_v1_api.create_namespaced_role_binding(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_role_binding_created, name=name):
@@ -533,7 +534,7 @@ class CalrissianContext:
 
         try:
             response = self.core_v1_api.create_namespaced_resource_quota(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_resource_quota_created, name=name):
@@ -565,7 +566,7 @@ class CalrissianContext:
 
         spec = client.V1PersistentVolumeClaimSpec(
             access_modes=access_modes,
-            resources=client.V1ResourceRequirements(
+            resources=client.V1VolumeResourceRequirements(
                 requests={"storage": size}
             ),  # noqa: E501
         )
@@ -576,7 +577,7 @@ class CalrissianContext:
 
         try:
             response = self.core_v1_api.create_namespaced_persistent_volume_claim(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_pvc_created, name=name):
@@ -627,7 +628,6 @@ class CalrissianContext:
             response = self.core_v1_api.create_namespaced_config_map(
                 namespace=self.namespace,
                 body=config_map,
-                pretty=True,
             )
 
             if not self.retry(self.is_config_map_created, name=name):
@@ -661,7 +661,6 @@ class CalrissianContext:
             response = self.core_v1_api.create_namespaced_secret(
                 namespace=self.namespace,
                 body=secret,
-                pretty=True,
             )
 
             if not self.retry(self.is_image_pull_secret_created, name=name):
@@ -733,7 +732,6 @@ class CalrissianContext:
                 name="default",
                 namespace=self.namespace,
                 body=service_account_body,
-                pretty=True,
             )
         except ApiException as e:
             raise e
