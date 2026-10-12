@@ -14,6 +14,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     environment: release
     permissions:
       id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
@@ -47,16 +48,10 @@ jobs:
       run: |
         cp ~/.kube/config ~/.kube/kubeconfig-t2-dev.yaml
         echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
+        echo "PYCALRISSIAN_SYNC_DISPOSE=true" >> $GITHUB_ENV
         echo "CI_TEST_SKIP=1" >> $GITHUB_ENV
     - name: Test package
       run: hatch -e test run nose2 --verbose
-    - name: Publish package distributions to PyPI (main)
-      if: github.ref == 'refs/heads/main'
+    - name: Publish package distributions to PyPI
+      if: github.event_name == 'release'
       uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        repository-url: https://upload.pypi.org/legacy/
-    - name: Publish package distributions to PyPI (develop)
-      if: github.ref == 'refs/heads/develop'
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        repository-url: https://test.pypi.org/legacy/

@@ -3,9 +3,9 @@ import json
 import os
 import time
 from http import HTTPStatus
-from typing import Dict, TextIO
+from typing import Dict, Optional, TextIO
 
-from kubernetes import client, config
+from kubernetes import client, config, watch
 from kubernetes.client import Configuration
 from kubernetes.client.models.v1_persistent_volume_claim import V1PersistentVolumeClaim
 from kubernetes.client.rest import ApiException
@@ -26,6 +26,7 @@ class CalrissianContext:
         kubeconfig_file: TextIO = None,
         labels: Dict = None,
         annotations: Dict = None,
+        service_account: str = None,
     ):
         """Creates a CalrissianContext object
 
@@ -61,6 +62,54 @@ class CalrissianContext:
         self.labels = labels
         self.annotations = annotations
 
+        self.existing_namespace = False
+        self.service_account = service_account
+
+    @classmethod
+    def from_existing_namespace(
+        cls,
+        namespace: str,
+        storage_class: str,
+        volume_size: str,
+        service_account: Optional[str] = None,
+        resource_quota: Optional[Dict] = None,
+        image_pull_secrets: Optional[Dict] = None,
+        kubeconfig_file: Optional[TextIO] = None,
+        labels: Optional[Dict] = None,
+        annotations: Optional[Dict] = None,
+    ) -> "CalrissianContext":
+        """
+        Creates a CalrissianContext for an existing Kubernetes namespace.
+
+        Args:
+            namespace (str): Name of the existing Kubernetes namespace (with the required
+                service account, roles, and role bindings already set up).
+            storage_class (str): Name of the storage class for the RWX persistent volume claim.
+            volume_size (str): Size of the RWX volume (e.g., "10G").
+            resource_quota (Optional[Dict]): Optional resource quota for the namespace.
+            image_pull_secrets (Optional[Dict]): Dictionary containing image pull secrets.
+            kubeconfig_file (Optional[TextIO]): File object pointing to the kubeconfig.
+            labels (Optional[Dict]): Optional labels to apply to namespace resources.
+            annotations (Optional[Dict]): Optional annotations to apply to namespace resources.
+
+        Returns:
+            CalrissianContext: An instance configured to use an existing namespace.
+        """
+        instance = cls(
+            namespace,
+            storage_class,
+            volume_size,
+            resource_quota,
+            image_pull_secrets,
+            kubeconfig_file,
+            labels,
+            annotations
+        )
+        instance.existing_namespace = True
+        instance.service_account = service_account
+
+        return instance
+
     def initialise(self):
         """Create the kubernetes resources to run a Calrissian job
 
@@ -71,36 +120,48 @@ class CalrissianContext:
             None
         """
         # create namespace
-        if not self.is_namespace_created():
-            logger.info(f"create namespace {self.namespace}")
-            self.create_namespace(labels=self.labels, annotations=self.annotations)
 
-        # create roles and role binding
-        roles = {}
+        if self.existing_namespace is False:
+            if not self.is_namespace_created():
+                logger.info(f"create namespace '{self.namespace}'.")
+                self.create_namespace(labels=self.labels, annotations=self.annotations)
 
-        roles["pod-manager-role"] = {
-            "verbs": ["create", "patch", "delete", "list", "watch"],
-            "role_binding": "pod-manager-default-binding",
-        }
+            # create roles and role binding
+            roles = {}
 
-        roles["log-reader-role"] = {
-            "verbs": ["get", "list"],
-            "role_binding": "log-reader-default-binding",
-        }
+            roles["pod-manager-role"] = {
+                "verbs": ["create", "patch", "delete", "list", "watch"],
+                "role_binding": "pod-manager-default-binding",
+            }
 
-        for key, value in roles.items():
-            logger.info(f"create role {key}")
-            response = self.create_role(
-                name=key,
-                verbs=value["verbs"],
-                resources=["pods", "pods/log"],
-                api_groups=["*"],
-            )
-            # print(type(response))
-            # assert(isinstance(response, V1Role))
-            logger.info(f"create role binding for role {key}")
-            self.create_role_binding(name=value["role_binding"], role=key)
-            # assert(isinstance(response, V1RoleBinding))
+            roles["log-reader-role"] = {
+                "verbs": ["get", "list"],
+                "role_binding": "log-reader-default-binding",
+            }
+
+            for key, value in roles.items():
+                logger.info(f"create role {key}")
+                # Add configmaps and secrets to pod-manager-role resources
+                resources = ["pods", "pods/log"]
+                if key == "pod-manager-role":
+                    resources.extend(["configmaps", "secrets"])
+                response = self.create_role(
+                    name=key,
+                    verbs=value["verbs"],
+                    resources=resources,
+                    api_groups=["*"],
+                )
+                # print(type(response))
+                # assert(isinstance(response, V1Role))
+                logger.info(f"create role binding for role {key}")
+                self.create_role_binding(name=value["role_binding"], role=key)
+                # assert(isinstance(response, V1RoleBinding))
+        else:
+            if not self.is_namespace_created():
+                logger.warning(f"Namespace '{self.namespace}' does not exist.")
+                raise ValueError(f"Namespace '{self.namespace}' was not found and cannot be reused.")
+            else:
+                logger.info(f"Namespace '{self.namespace}' exists. Proceeding to reuse it.")
 
         # create volumes
         logger.info(
@@ -151,11 +212,12 @@ class CalrissianContext:
         logger.info(f"dispose namespace {self.namespace}")
         try:
             response = self.core_v1_api.delete_namespace(
-                name=self.namespace, pretty=True, grace_period_seconds=0
+                name=self.namespace, grace_period_seconds=0
             )
 
-            # if not self.retry(self.dispose):
-            #     raise ApiException()
+            if os.getenv("PYCALRISSIAN_SYNC_DISPOSE", False)=="true":
+                if not self.retry(self.is_namespace_deleted, max_tries=20):
+                    raise ApiException()
             logger.info(f"namespace {self.namespace} deleted")
             return response
 
@@ -266,7 +328,7 @@ class CalrissianContext:
 
     def is_namespace_deleted(self, **kwargs):
         """Helper function for retry in dispose"""
-        return not self.is_namespace_created()
+        return None if self.is_namespace_created() else True
 
     def is_role_binding_created(self, **kwargs):
 
@@ -296,17 +358,33 @@ class CalrissianContext:
 
     @staticmethod
     def retry(fun, max_tries=10, interval=5, **kwargs):
+        """Retry a check function using exponential backoff.
+
+        Uses a short initial delay that doubles on each retry (capped at
+        `interval` seconds) so that fast-completing resources are detected
+        quickly while still bounding the total wait time.
+        """
+        delay = min(1, interval)  # Start with a 1-second delay
         for i in range(max_tries):
             try:
-                time.sleep(interval)
-                return fun(**kwargs)
+                time.sleep(delay)
+                result = fun(**kwargs)
+                if result is not None:
+                    return result
             except ApiException as exc:
-                if exc.status.value < 500 and exc.status.value != 429:
+                status_code = (
+                    exc.status.value
+                    if hasattr(exc.status, "value")
+                    else exc.status
+                )
+                if status_code < 500 and status_code != 429:
                     # Useless to retry against a 4xx/not-429
                     raise exc
             except Exception:
-                continue
-        if i == max_tries:
+                pass
+            # Exponential backoff, capped at the requested interval
+            delay = min(delay * 2, interval)
+        if i == max_tries - 1:
             raise ApiException()
 
     def create_namespace(
@@ -363,7 +441,7 @@ class CalrissianContext:
         try:
             response = (
                 self.rbac_authorization_v1_api.create_namespaced_role(  # noqa: E501
-                    self.namespace, body, pretty=True
+                    self.namespace, body
                 )
             )
 
@@ -413,7 +491,7 @@ class CalrissianContext:
 
         try:
             response = self.rbac_authorization_v1_api.create_namespaced_role_binding(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_role_binding_created, name=name):
@@ -456,7 +534,7 @@ class CalrissianContext:
 
         try:
             response = self.core_v1_api.create_namespaced_resource_quota(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_resource_quota_created, name=name):
@@ -488,7 +566,7 @@ class CalrissianContext:
 
         spec = client.V1PersistentVolumeClaimSpec(
             access_modes=access_modes,
-            resources=client.V1ResourceRequirements(
+            resources=client.V1VolumeResourceRequirements(
                 requests={"storage": size}
             ),  # noqa: E501
         )
@@ -499,7 +577,7 @@ class CalrissianContext:
 
         try:
             response = self.core_v1_api.create_namespaced_persistent_volume_claim(  # noqa: E501
-                self.namespace, body, pretty=True
+                self.namespace, body
             )
 
             if not self.retry(self.is_pvc_created, name=name):
@@ -550,7 +628,6 @@ class CalrissianContext:
             response = self.core_v1_api.create_namespaced_config_map(
                 namespace=self.namespace,
                 body=config_map,
-                pretty=True,
             )
 
             if not self.retry(self.is_config_map_created, name=name):
@@ -584,7 +661,6 @@ class CalrissianContext:
             response = self.core_v1_api.create_namespaced_secret(
                 namespace=self.namespace,
                 body=secret,
-                pretty=True,
             )
 
             if not self.retry(self.is_image_pull_secret_created, name=name):
@@ -656,7 +732,6 @@ class CalrissianContext:
                 name="default",
                 namespace=self.namespace,
                 body=service_account_body,
-                pretty=True,
             )
         except ApiException as e:
             raise e

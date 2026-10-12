@@ -10,7 +10,7 @@ import uuid
 from tempfile import TemporaryFile
 from typing import Dict
 
-from kubernetes import client, config
+from kubernetes import client, config, watch as k8s_watch
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 
@@ -54,13 +54,29 @@ class HelperPod:
         resp = api_instance.create_namespaced_pod(
             body=pod_manifest, namespace=self.namespace
         )
-        while True:
+        # Use Kubernetes Watch API to wait for pod to leave Pending phase
+        # instead of polling with time.sleep
+        w = k8s_watch.Watch()
+        try:
+            for event in w.stream(
+                api_instance.list_namespaced_pod,
+                namespace=self.namespace,
+                field_selector=f"metadata.name={self.pod_name}",
+                timeout_seconds=120,
+            ):
+                pod = event["object"]
+                if pod.status.phase != "Pending":
+                    w.stop()
+                    break
+        except ApiException:
+            # Fallback: if watch fails, verify current state
             resp = api_instance.read_namespaced_pod(
                 name=self.pod_name, namespace=self.namespace
             )
-            if resp.status.phase != "Pending":
-                break
-            time.sleep(1)
+            if resp.status.phase == "Pending":
+                raise RuntimeError(
+                    f"Pod {self.pod_name} still pending after watch failure"
+                )
 
     def dismiss(self):
         try:

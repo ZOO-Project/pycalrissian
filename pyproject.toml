@@ -27,10 +27,10 @@ classifiers = [
 ]
 dependencies = [
     "loguru",
-    "typing-extensions==4.8.0",
-    "kubernetes==28.1.0",
-    "cwltool==3.1.20240708091337",
-    "setuptools==70.0.0"
+    "typing-extensions>=4.8.0",
+    "kubernetes==35.0.0",
+    "cwltool>=3.1.20240708091337",
+    "setuptools>=70.0.0"
 ]
 
 [project.urls]
@@ -50,7 +50,7 @@ include = [
 extra-dependencies = [
   "loguru",
   "typing",
-  "kubernetes==28.1.0",
+  "kubernetes==35.0.0",
 ]
 
 [tool.coverage.run]
@@ -68,13 +68,14 @@ tests = ["tests"]
 [tool.hatch.envs.default]
 skip-install = false
 dependencies = [
+    "packaging",
     "nose2",
     "coverage",
     "loguru",
-    "typing-extensions==4.8.0",
-    "kubernetes==28.1.0",
-    "cwltool==3.1.20240708091337",
-    "setuptools==70.0.0"
+    "typing-extensions>=4.8.0",
+    "kubernetes==35.0.0",
+    "cwltool>=3.1.20240708091337",
+    "setuptools>=70.0.0"
 ]
 
 ## [project.scripts]
